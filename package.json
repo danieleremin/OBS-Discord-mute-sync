@@ -1,0 +1,16 @@
+{
+  "name": "discord-obs-mute-bridge",
+  "version": "1.0.0",
+  "description": "Mirrors the Discord desktop app's mute button onto one OBS microphone input.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node bridge.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "obs-websocket-js": "^5.0.8"
+  }
+}
