@@ -15,11 +15,18 @@
 //   3. npm install
 //   4. npm start     (the first run creates config.json; fill it in, start again)
 //   5. Click "Authorize" in the prompt that pops up inside Discord (first run only).
+//
+// Optional, once it works: let OBS start it for you, without a window.
+//   node bridge.js --make-obs-script     then add the file it writes under
+//   OBS -> Tools -> Scripts. OBS then starts the bridge each time OBS starts, and
+//   the bridge stops when OBS closes. What it does is written to bridge.log.
 
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
-import { readFile, writeFile } from 'node:fs/promises';
+import { appendFileSync, writeFileSync } from 'node:fs';
+import { readFile, rm, writeFile } from 'node:fs/promises';
 import net from 'node:net';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import OBSWebSocket, { EventSubscription } from 'obs-websocket-js';
@@ -32,6 +39,14 @@ if (Number(process.versions.node.split('.')[0]) < 20) {
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_FILE = path.join(HERE, 'config.json');
 const TOKEN_FILE = path.join(HERE, 'discord-token.json'); // saved login, so Discord only asks once
+const LOG_FILE = path.join(HERE, 'bridge.log'); // what the bridge did, for when it runs without a window
+const OBS_SCRIPT_FILE = path.join(HERE, 'start-bridge-with-obs.lua');
+
+// --with-obs: started by OBS through that script. No window, so everything is also
+// written to bridge.log, and the bridge ends when OBS closes.
+const WITH_OBS = process.argv.includes('--with-obs');
+const OBS_WAIT_MS = 2 * 60_000; // with --with-obs: give up if OBS has not answered by then
+const STARTED_AT = Date.now();
 
 const DEFAULT_CONFIG = {
   discordClientId: '',
@@ -56,8 +71,19 @@ const RENEW_MARGIN_MS = 60 * 60 * 1000; // renew the Discord login an hour befor
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function toLogFile(text) {
+  if (!WITH_OBS) return;
+  try {
+    appendFileSync(LOG_FILE, `${text}\n`);
+  } catch {
+    // the log file is a convenience, never a reason to stop
+  }
+}
+
 function log(message) {
-  console.log(`[${new Date().toLocaleTimeString()}] ${message}`);
+  const line = `[${new Date().toLocaleTimeString()}] ${message}`;
+  console.log(line);
+  toLogFile(line);
 }
 
 // Like log(), but stays quiet while the same message repeats (retry loops).
@@ -71,6 +97,7 @@ function status(side, message) {
 // A problem that retrying cannot fix (wrong setting, declined prompt, ...).
 function fatal(message) {
   console.error(`\n${message}\n`);
+  toLogFile(`\n${message}\n`);
   process.exit(1);
 }
 
@@ -84,6 +111,155 @@ function withTimeout(promise, ms, message) {
     timer = setTimeout(() => reject(new Error(message)), ms);
   });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+// ---------------------------------------------------------------------------
+// Starting together with OBS: node bridge.js --make-obs-script
+// ---------------------------------------------------------------------------
+
+// OBS can run Lua scripts (Tools -> Scripts). This one starts the bridge when OBS
+// starts. The paths of Node and of this file are written into it as they are now.
+const OBS_SCRIPT = String.raw`-- Starts the Discord -> OBS mute bridge whenever OBS starts. The bridge stops by
+-- itself when OBS closes. Made by:  node bridge.js --make-obs-script
+-- (run that again if you move the bridge folder or reinstall Node.js)
+obs = obslua
+
+local NODE = @NODE@
+local BRIDGE = @BRIDGE@
+local FOLDER = @FOLDER@
+
+local on_windows = package.config:sub(1, 1) == "\\"
+
+local function exists(file)
+  local handle = io.open(file, "r")
+  if handle then handle:close() end
+  return handle ~= nil
+end
+
+-- Windows: ask the shell to open node.exe with its window hidden (SW_HIDE), so no
+-- console window pops up over a game. Text is passed as UTF-16 so any folder name works.
+local function start_on_windows(node)
+  local ffi = require("ffi")
+  ffi.cdef[[
+    int MultiByteToWideChar(unsigned int codepage, unsigned long flags, const char* text, int bytes, wchar_t* out, int chars);
+    void* ShellExecuteW(void* window, const wchar_t* verb, const wchar_t* file, const wchar_t* arguments, const wchar_t* folder, int show);
+  ]]
+  local kernel32 = ffi.load("kernel32")
+  local function wide(text)
+    local chars = kernel32.MultiByteToWideChar(65001, 0, text, -1, nil, 0)
+    local buffer = ffi.new("wchar_t[?]", chars)
+    kernel32.MultiByteToWideChar(65001, 0, text, -1, buffer, chars)
+    return buffer
+  end
+  local SW_HIDE = 0
+  local arguments = '"' .. BRIDGE .. '" --with-obs'
+  local result = ffi.load("shell32").ShellExecuteW(nil, wide("open"), wide(node), wide(arguments), wide(FOLDER), SW_HIDE)
+  local code = tonumber(ffi.cast("intptr_t", result))
+  if code <= 32 then
+    error("Windows could not start " .. node .. " (ShellExecute code " .. code .. ")")
+  end
+end
+
+-- macOS and Linux: run it in the background through the shell.
+local function start_on_unix(node)
+  local function quote(text)
+    return "'" .. text:gsub("'", "'\\''") .. "'"
+  end
+  os.execute(quote(node) .. " " .. quote(BRIDGE) .. " --with-obs >/dev/null 2>&1 &")
+end
+
+local function start_bridge()
+  local node = exists(NODE) and NODE or "node" -- else whatever "node" is on the PATH
+  local ok, problem = pcall(on_windows and start_on_windows or start_on_unix, node)
+  if ok then
+    print("Mute bridge: started. It writes what it does to bridge.log in " .. FOLDER)
+  else
+    print("Mute bridge: could not be started: " .. tostring(problem))
+  end
+end
+
+function script_description()
+  return "Starts the Discord -> OBS mute bridge when OBS starts. The bridge stops by itself when OBS closes.\n\n"
+    .. "What it does is written to bridge.log in " .. FOLDER
+end
+
+function script_properties()
+  local props = obs.obs_properties_create()
+  obs.obs_properties_add_button(props, "start_bridge", "Start the bridge now", function()
+    start_bridge()
+    return false
+  end)
+  return props
+end
+
+function script_load(settings)
+  start_bridge()
+end
+`;
+
+// Text as a quoted Lua string.
+function luaString(text) {
+  return `"${text.replace(/[\\"]/g, '\\$&').replace(/\n/g, '\\n').replace(/\r/g, '\\r')}"`;
+}
+
+if (process.argv.includes('--make-obs-script')) {
+  const values = { NODE: process.execPath, BRIDGE: fileURLToPath(import.meta.url), FOLDER: HERE };
+  await writeFile(OBS_SCRIPT_FILE, OBS_SCRIPT.replace(/@(NODE|BRIDGE|FOLDER)@/g, (_, name) => luaString(values[name])));
+  console.log(
+    `Wrote ${OBS_SCRIPT_FILE}\n\n` +
+      'In OBS: Tools -> Scripts -> "+" -> choose that file. From then on OBS starts the\n' +
+      'bridge (without a window) each time OBS starts, and the bridge stops when OBS closes.\n' +
+      'What it does is written to bridge.log in this folder.\n' +
+      'Run this command again if you move this folder or reinstall Node.js.',
+  );
+  process.exit(0);
+}
+
+// ---------------------------------------------------------------------------
+// Only one copy at a time (a second one would open a second connection to Discord)
+// ---------------------------------------------------------------------------
+
+// The running copy listens on a local pipe; the pipe is free again when that copy ends.
+const LOCK_PATH = process.platform === 'win32' ? '\\\\.\\pipe\\discord-obs-mute-bridge' : path.join(tmpdir(), 'discord-obs-mute-bridge.sock');
+let lock; // kept so the pipe stays open for as long as this copy runs
+
+async function isOnlyCopy() {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const problem = await new Promise((resolve) => {
+      lock = net.createServer((socket) => socket.destroy());
+      lock.once('error', (err) => resolve(err.code));
+      lock.listen(LOCK_PATH, () => resolve(null));
+    });
+    if (problem === null) {
+      lock.unref();
+      return true;
+    }
+    if (problem !== 'EADDRINUSE') return true; // cannot tell: better to run than to refuse
+    const answered = await new Promise((resolve) => {
+      const probe = net.connect(LOCK_PATH);
+      probe.once('connect', () => {
+        probe.destroy();
+        resolve(true);
+      });
+      probe.once('error', () => resolve(false));
+      probe.once('close', () => resolve(false));
+    });
+    if (answered) return false;
+    await rm(LOCK_PATH, { force: true }).catch(() => {}); // macOS/Linux: file left behind by a copy that ended
+  }
+  return true;
+}
+
+if (!(await isOnlyCopy())) {
+  if (WITH_OBS) process.exit(0); // OBS asked twice (script reloaded): the running copy carries on
+  fatal(`The bridge is already running, probably started by OBS. If it does not seem to work, look at ${LOG_FILE}`);
+}
+if (WITH_OBS) {
+  try {
+    writeFileSync(LOG_FILE, ''); // a fresh log for each OBS session
+  } catch {
+    // see toLogFile()
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -271,6 +447,10 @@ async function runObs() {
       status('obs', `OBS: connected. Controlling "${micInput}" and nothing else.`);
       syncObs();
       await closed;
+      if (WITH_OBS) {
+        log('OBS: closed. The bridge stops with it.');
+        process.exit(0);
+      }
       status('obs', 'OBS: connection closed. Waiting for OBS to come back...');
     } catch (err) {
       obs.off('ConnectionClosed', onClosed);
@@ -280,6 +460,10 @@ async function runObs() {
       }
       status('obs', describeObsError(err));
       await obs.disconnect().catch(() => {});
+      if (WITH_OBS && Date.now() - STARTED_AT > OBS_WAIT_MS) {
+        log('OBS: no answer for two minutes. The bridge stops (is the WebSocket server still enabled?).');
+        process.exit(0);
+      }
     }
     micInput = null;
     await sleep(RETRY_MS);
@@ -668,6 +852,6 @@ async function runDiscord() {
 
 // ---------------------------------------------------------------------------
 
-log('Discord -> OBS mute bridge running. Press Ctrl+C to stop.');
+log(WITH_OBS ? 'Discord -> OBS mute bridge started by OBS.' : 'Discord -> OBS mute bridge running. Press Ctrl+C to stop.');
 runObs().catch((err) => fatal(`OBS side stopped unexpectedly: ${err.stack}`));
 runDiscord().catch((err) => fatal(`Discord side stopped unexpectedly: ${err.stack}`));
